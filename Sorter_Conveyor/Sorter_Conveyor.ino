@@ -1,46 +1,62 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
-// Replace with your network credentials
+// WiFi credentials
 const char* ssid = "YasiruDEX";
 const char* password = "freewifi";
 
 // Sorter motor pins
 #define SORTER_STEP_PIN 12
 #define SORTER_DIR_PIN 14
+#define SORTER_EN_PIN 13
 
 // Conveyor motor pins
 #define CONVEYOR_STEP_PIN 2
 #define CONVEYOR_DIR_PIN 4
+#define CONVEYOR_EN_PIN 5
 
 // Motion parameters
 const int stepsPerRev = 200;
-int conveyorDelayTime = 200;  // Default speed (microseconds)
-bool conveyorRunning = false;
-bool sorterForward = true;    // Track sorter direction
+volatile int conveyorDelayTime = 30;   // microseconds per half-cycle
+volatile bool conveyorRunning = false;
+bool sorterForward = true;
 
 // Anomaly handling
-bool anomalyMode = false;
-long anomalyStepCount = 0;
-const long anomalyTotalSteps = stepsPerRev * 10;  // 10 revolutions
+volatile bool anomalyMode = false;
+volatile long anomalyStepCount = 0;
+const long anomalyTotalSteps = stepsPerRev * 10;
 
-// Create web server on port 80
+// Create web server
 WebServer server(80);
 
-unsigned long lastConveyorStep = 0;
+// Hardware timer
+hw_timer_t* stepTimer = NULL;
 
+// Function prototypes
+void moveSorter(long steps);
+void IRAM_ATTR onStepTimer();
+
+// === SETUP ===
 void setup() {
   Serial.begin(115200);
-  
-  // Set pin modes
+  delay(1000);
+
+  // Setup pins
   pinMode(SORTER_STEP_PIN, OUTPUT);
   pinMode(SORTER_DIR_PIN, OUTPUT);
+  pinMode(SORTER_EN_PIN, OUTPUT);
   pinMode(CONVEYOR_STEP_PIN, OUTPUT);
   pinMode(CONVEYOR_DIR_PIN, OUTPUT);
-  
+  pinMode(CONVEYOR_EN_PIN, OUTPUT);
+
+  digitalWrite(SORTER_EN_PIN, LOW);
+  digitalWrite(CONVEYOR_EN_PIN, LOW);
   digitalWrite(CONVEYOR_DIR_PIN, HIGH);
-  
-  // Connect to WiFi
+  digitalWrite(CONVEYOR_STEP_PIN, LOW);
+
+  Serial.println("Stepper drivers ENABLED");
+
+  // Connect WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -48,154 +64,172 @@ void setup() {
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("Connected! IP address: ");
+  Serial.print("Connected! IP: ");
   Serial.println(WiFi.localIP());
-  
-  // Define API endpoints
+
+  // === Create hardware timer ===
+  // New API in ESP32 Core 3.x: timerBegin(frequency)
+  stepTimer = timerBegin(1000000); // 1 MHz timer (1 µs tick)
+  timerAttachInterrupt(stepTimer, &onStepTimer);
+  timerAlarm(stepTimer, conveyorDelayTime, true, 0); // auto-reload on
+
+  // Define HTTP endpoints
   server.on("/flip", handleFlip);
   server.on("/continuous", handleContinuous);
   server.on("/stop", handleStop);
   server.on("/anomaly", handleAnomaly);
+  server.on("/status", handleStatus);
   server.on("/", handleRoot);
-  
+
   server.begin();
   Serial.println("HTTP server started");
-  Serial.println("Available endpoints:");
-  Serial.println("  GET /flip - Toggle sorter direction");
-  Serial.println("  GET /continuous?speed=<value> - Start conveyor at speed");
-  Serial.println("  GET /stop - Stop conveyor");
-  Serial.println("  GET /anomaly - Move conveyor 10 revolutions");
+  Serial.println("Ready: http://" + WiFi.localIP().toString());
 }
 
+// === MAIN LOOP ===
 void loop() {
   server.handleClient();
-  
-  // Handle anomaly mode (highest priority)
-  if (anomalyMode) {
-    if (anomalyStepCount < anomalyTotalSteps) {
-      digitalWrite(CONVEYOR_STEP_PIN, HIGH);
-      delayMicroseconds(conveyorDelayTime);
-      digitalWrite(CONVEYOR_STEP_PIN, LOW);
-      delayMicroseconds(conveyorDelayTime);
+}
+
+// === TIMER ISR ===
+void IRAM_ATTR onStepTimer() {
+  static bool stepState = false;
+  if (conveyorRunning || anomalyMode) {
+    digitalWrite(CONVEYOR_STEP_PIN, stepState);
+    stepState = !stepState;
+
+    if (anomalyMode && !stepState) {
       anomalyStepCount++;
-    } else {
-      anomalyMode = false;
-      anomalyStepCount = 0;
-      conveyorRunning = false;
-      Serial.println("Anomaly mode completed");
-    }
-    return;  // Skip other operations during anomaly
-  }
-  
-  // Handle continuous conveyor movement
-  if (conveyorRunning) {
-    unsigned long currentMicros = micros();
-    if (currentMicros - lastConveyorStep >= conveyorDelayTime) {
-      digitalWrite(CONVEYOR_STEP_PIN, HIGH);
-      delayMicroseconds(10);
-      digitalWrite(CONVEYOR_STEP_PIN, LOW);
-      lastConveyorStep = currentMicros;
+      if (anomalyStepCount >= anomalyTotalSteps * 2) {
+        anomalyMode = false;
+        anomalyStepCount = 0;
+        conveyorRunning = false;
+      }
     }
   }
 }
 
-// API Endpoint Handlers
-
-// GET /flip - Toggle sorter motor direction
+// === API HANDLERS ===
 void handleFlip() {
   if (anomalyMode) {
-    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Anomaly mode active\"}");
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Anomaly active\"}");
     return;
   }
-  
+
+  bool wasRunning = conveyorRunning;
+  conveyorRunning = false;
+  delay(100);
+
+  digitalWrite(SORTER_EN_PIN, LOW);
+  delay(10);
+
   if (sorterForward) {
-    Serial.println("Sorter: Moving backward");
+    Serial.println("Sorter BACKWARD");
     digitalWrite(SORTER_DIR_PIN, LOW);
-    moveSorter(stepsPerRev * 8);  // 8 revolutions backward
+    moveSorter(stepsPerRev * 8);
     sorterForward = false;
   } else {
-    Serial.println("Sorter: Moving forward");
+    Serial.println("Sorter FORWARD");
     digitalWrite(SORTER_DIR_PIN, HIGH);
-    moveSorter(stepsPerRev * 8);  // 8 revolutions forward
+    moveSorter(stepsPerRev * 8);
     sorterForward = true;
   }
-  
-  String response = "{\"status\":\"success\",\"direction\":\"" + 
-                    String(sorterForward ? "forward" : "backward") + "\"}";
+
+  conveyorRunning = wasRunning;
+  String response = "{\"status\":\"success\",\"direction\":\"";
+  response += sorterForward ? "forward" : "backward";
+  response += "\"}";
   server.send(200, "application/json", response);
 }
 
-// GET /continuous?speed=<value> - Start conveyor at specified speed
 void handleContinuous() {
   if (anomalyMode) {
-    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Anomaly mode active\"}");
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Anomaly active\"}");
     return;
   }
-  
+
   if (server.hasArg("speed")) {
     int speed = server.arg("speed").toInt();
-    if (speed > 0 && speed <= 10000) {
+    if (speed >= 50 && speed <= 5000) {
       conveyorDelayTime = speed;
+      timerAlarm(stepTimer, conveyorDelayTime, true, 0);
       conveyorRunning = true;
-      lastConveyorStep = micros();
-      
-      Serial.print("Conveyor started at speed: ");
-      Serial.print(speed);
-      Serial.println(" μs");
-      
-      String response = "{\"status\":\"success\",\"speed\":" + String(speed) + ",\"running\":true}";
+
+      Serial.printf("Conveyor running at %d µs per half-cycle\n", speed);
+
+      String response = "{\"status\":\"success\",\"speed\":";
+      response += String(speed);
+      response += ",\"running\":true}";
       server.send(200, "application/json", response);
     } else {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Speed must be between 1-10000\"}");
+      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Speed 50-5000\"}");
     }
   } else {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing speed parameter\"}");
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing speed\"}");
   }
 }
 
-// GET /stop - Stop conveyor motor
 void handleStop() {
   conveyorRunning = false;
-  Serial.println("Conveyor stopped");
+  digitalWrite(CONVEYOR_STEP_PIN, LOW);
+  Serial.println("Conveyor STOPPED");
   server.send(200, "application/json", "{\"status\":\"success\",\"running\":false}");
 }
 
-// GET /anomaly - Move conveyor 10 revolutions (stops all other actions)
 void handleAnomaly() {
+  Serial.println("ANOMALY MODE");
   anomalyMode = true;
   anomalyStepCount = 0;
   conveyorRunning = false;
-  
-  Serial.println("Anomaly mode activated - Moving conveyor 10 revolutions");
-  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Anomaly mode activated\",\"revolutions\":10}");
+  server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Anomaly: 10 rev\"}");
 }
 
-// GET / - Root endpoint with API documentation
+void handleStatus() {
+  String status = "{\"conveyor_running\":";
+  status += conveyorRunning ? "true" : "false";
+  status += ",\"conveyor_speed\":";
+  status += String(conveyorDelayTime);
+  status += ",\"anomaly_active\":";
+  status += anomalyMode ? "true" : "false";
+  status += ",\"sorter_direction\":\"";
+  status += sorterForward ? "forward" : "backward";
+  status += "\"}";
+  server.send(200, "application/json", status);
+}
+
 void handleRoot() {
-  String html = "<html><body><h1>Stepper Motor Control API</h1>";
-  html += "<h2>Available Endpoints:</h2>";
-  html += "<ul>";
-  html += "<li><b>GET /flip</b> - Toggle sorter motor direction (forward/backward 8 revolutions)</li>";
-  html += "<li><b>GET /continuous?speed=VALUE</b> - Start conveyor at specified speed (1-10000 microseconds)</li>";
-  html += "<li><b>GET /stop</b> - Stop conveyor motor</li>";
-  html += "<li><b>GET /anomaly</b> - Emergency: Move conveyor 10 revolutions (stops all other operations)</li>";
-  html += "</ul>";
-  html += "<h2>Quick Test Links:</h2>";
-  html += "<p><a href='/flip'>Flip Sorter</a></p>";
-  html += "<p><a href='/continuous?speed=200'>Start Conveyor (speed=200)</a></p>";
-  html += "<p><a href='/stop'>Stop Conveyor</a></p>";
-  html += "<p><a href='/anomaly'>Trigger Anomaly</a></p>";
-  html += "</body></html>";
-  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f5f5f5;}";
+  html += ".btn{padding:15px 25px;margin:10px 5px;border:none;border-radius:8px;";
+  html += "font-size:16px;cursor:pointer;color:white;text-decoration:none;}";
+  html += ".green{background:#28a745;}.red{background:#dc3545;}.blue{background:#007bff;}.orange{background:#fd7e14;}";
+  html += "h1{color:#333;}.container{background:white;padding:20px;border-radius:10px;}</style></head><body>";
+  html += "<div class='container'><h1>Stepper Motor Control</h1>";
+  html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
+  html += "<h2>Conveyor Speed</h2>";
+  html += "<a href='/continuous?speed=100' class='btn green'>Very Fast (100us)</a>";
+  html += "<a href='/continuous?speed=200' class='btn green'>Fast (200us)</a>";
+  html += "<a href='/continuous?speed=500' class='btn green'>Medium (500us)</a>";
+  html += "<a href='/continuous?speed=1000' class='btn green'>Slow (1000us)</a>";
+  html += "<a href='/continuous?speed=2000' class='btn green'>Very Slow (2000us)</a>";
+  html += "<h2>Controls</h2>";
+  html += "<a href='/flip' class='btn blue'>Flip Sorter</a>";
+  html += "<a href='/stop' class='btn red'>Stop Conveyor</a>";
+  html += "<a href='/anomaly' class='btn orange'>Anomaly (10 rev)</a>";
+  html += "<a href='/status' class='btn blue'>Status</a>";
+  html += "</div></body></html>";
   server.send(200, "text/html", html);
 }
 
-// Helper function to move sorter motor
+// === SORTER STEPPER ===
 void moveSorter(long steps) {
   for (long i = 0; i < steps; i++) {
     digitalWrite(SORTER_STEP_PIN, HIGH);
-    delayMicroseconds(200);
+    delayMicroseconds(5);
     digitalWrite(SORTER_STEP_PIN, LOW);
-    delayMicroseconds(200);
+    delayMicroseconds(500);
+    if (i % 200 == 0 && i > 0) Serial.print(".");
   }
+  Serial.println();
 }
